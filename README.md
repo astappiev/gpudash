@@ -1,8 +1,8 @@
 # gpudash
 
-This fork uses `sinfo` to get list of nodes and queries Prometheus with specified period and interval to get GPU utilization data and display it in a text dashboard. By default it shows GPU utilization for all users over the last hour with 10-minute intervals.
+This fork queries Prometheus with specified period and interval to get GPU utilization data and display it in a text dashboard. By default it shows GPU utilization for all users over the last hour with 10-minute intervals.
 
-The original implementation requires a static list of nodes to be specified in the code. As well as cronjob to capture GPU utilization from prometheus and store in text files, I found that counter-intuitive, because prometheus is already storing that data.
+The original implementation requires a static list of nodes to be specified in the code. As well as cronjob to capture GPU utilization from prometheus and store in text files, I found that counter-intuitive, because prometheus is already storing all that data.
 
 ---
 
@@ -51,6 +51,9 @@ Examples:
 
   Show dashboard for all users without displaying legend:
     $ gpudash -n
+
+  Output data in JSON format for programmatic use:
+    $ gpudash --json | jq '.summary'
 ```
 
 ## Getting Started

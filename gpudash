@@ -17,74 +17,35 @@ from blessed import Terminal
 # Configuration
 PROM_URL = os.getenv("GPUDASH_PROM_URL", "http://localhost:9200/prom/neumann")
 
-
-def get_nodes():
-    """Parse sinfo output to get node names, GPU counts, and filter out offline nodes."""
-    try:
-        output = subprocess.run('sinfo -N -h -o "%N,%G,%t"', capture_output=True, shell=True, timeout=10, check=True)
-        lines = output.stdout.decode("utf-8").strip().split("\n")
-
-        nodes_gpus = {}
-        seen_nodes = set()
-
-        for line in lines:
-            if not line.strip():
-                continue
-            parts = line.split(",")
-            if len(parts) < 3:
-                continue
-
-            node_name = parts[0].strip()
-
-            # make sure we only process each node once
-            if node_name in seen_nodes:
-                continue
-            seen_nodes.add(node_name)
-
-            state = parts[-1].strip()
-            gres_info = ",".join(parts[1:-1])
-
-            # Skip nodes that are offline, draining, or down
-            if any([term in state.lower() for term in ["drain", "down", "boot"]]):
-                continue
-
-            # Parse GPU count from GRES string like "gpu:a100:8(S:0-1)"
-            # Format can be: gpu:type:count(S:...) or multiple comma-separated entries
-            total_gpus = 0
-            for gres_part in gres_info.split(","):
-                gres_part = gres_part.strip()
-                if gres_part.startswith("gpu:"):
-                    # Extract count from gpu:type:count(...)
-                    match = re.search(r"gpu:[^:]+:(\d+)", gres_part)
-                    if match:
-                        total_gpus += int(match.group(1))
-
-            if total_gpus > 0:
-                nodes_gpus[node_name] = total_gpus
-
-        return nodes_gpus
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        print(f"Error running sinfo command: {e}")
-        return {}
+# Utilization thresholds (can be overridden via environment variables)
+UTIL_THRESHOLD_LOW = int(os.getenv("GPUDASH_UTIL_THRESHOLD_LOW", "25"))
+UTIL_THRESHOLD_MED = int(os.getenv("GPUDASH_UTIL_THRESHOLD_MED", "50"))
+UTIL_THRESHOLD_HIGH = int(os.getenv("GPUDASH_UTIL_THRESHOLD_HIGH", "75"))
 
 
-def query_prometheus_range(metric_name, start_time, end_time, step="5m"):
-    """Query Prometheus for a metric over a time range."""
+def query_prometheus_range(metric_name, start_time, end_time, step="5m", retries=3):
+    """Query Prometheus for a metric over a time range with retry logic."""
     url = f"{PROM_URL}/api/v1/query_range?query={metric_name}&start={start_time}&end={end_time}&step={step}"
 
-    try:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            data = response.read()
-            return json.loads(data)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
-        print(f"Error querying Prometheus for {metric_name}: {e}")
-        return {"status": "error", "data": {"result": []}}
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                data = response.read()
+                return json.loads(data)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+            if attempt < retries - 1:
+                wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+                print(f"Warning: Prometheus query failed (attempt {attempt + 1}/{retries}), retrying in {wait_time}s...", file=sys.stderr)
+                time.sleep(wait_time)
+            else:
+                print(f"Error querying Prometheus for {metric_name}: {e}")
+                return {"status": "error", "data": {"result": []}}
 
 
 def generate_uid2user_mapping():
     """Generate uid to username mapping dictionary using getent passwd."""
     try:
-        output = subprocess.run("getent passwd", shell=True, capture_output=True, timeout=10, check=True)
+        output = subprocess.run(["getent", "passwd"], capture_output=True, timeout=10, check=True)
         lines = output.stdout.decode("utf-8").strip().split("\n")
         uid2user = {}
         for line in lines:
@@ -99,22 +60,36 @@ def generate_uid2user_mapping():
         return {}
 
 
-def process_range_data(metric_data, nodelist, uid2user=None):
+def process_range_data(metric_data, uid2user=None):
     """
     Process Prometheus range query data and organize by timestamp.
-    Returns: dict with structure {timestamp: {(node, gpu_index): value}}
+    Returns:
+        - dict with structure {timestamp: {(node, gpu_index): value}}
+        - dict with structure {node: gpu_count}
     """
     result = {}
+    nodes_gpus = {}
 
     if metric_data.get("status") != "success":
-        return result
+        return result, nodes_gpus
 
     for series in metric_data.get("data", {}).get("result", []):
-        hostname = series["metric"]["instance"].split(":")[0]
-        if hostname not in nodelist:
+        hostname = series["metric"].get("instance", "")
+        # Handle case where instance might have port
+        if ":" in hostname:
+            hostname = hostname.split(":")[0]
+
+        if not hostname:
             continue
 
         gpu_index = series["metric"]["minor_number"]
+
+        # Track nodes and GPU indices for node discovery
+        if hostname not in nodes_gpus:
+            nodes_gpus[hostname] = set()
+        if gpu_index is not None:
+            nodes_gpus[hostname].add(int(gpu_index))
+
         values = series.get("values", [])
 
         for timestamp, value in values:
@@ -125,10 +100,22 @@ def process_range_data(metric_data, nodelist, uid2user=None):
             # Convert UID to username if this is UID data and mapping is available
             if uid2user and value in uid2user:
                 value = uid2user[value]
+            elif not uid2user:
+                # For utilization data, round float values to integers
+                try:
+                    value = str(int(round(float(value))))
+                except (ValueError, TypeError):
+                    value = "N/A"
 
             result[ts][(hostname, gpu_index)] = value
 
-    return result
+    # Convert sets to GPU counts (max GPU index + 1)
+    gpu_counts = {}
+    for hostname, gpu_indices in nodes_gpus.items():
+        if gpu_indices:
+            gpu_counts[hostname] = max(gpu_indices) + 1
+
+    return result, gpu_counts
 
 
 def center(maxlen, txt):
@@ -173,11 +160,11 @@ def colorize(user, util, term, padding):
         return term.on_gray + term.black + padding(text) + term.normal
     elif util_int == 0:
         return term.on_black + white + padding(text) + term.normal
-    elif util_int < 25:
+    elif util_int < UTIL_THRESHOLD_LOW:
         return term.on_blue + white + padding(text) + term.normal
-    elif util_int < 50:
+    elif util_int < UTIL_THRESHOLD_MED:
         return term.on_cyan + term.black + padding(text) + term.normal
-    elif util_int < 75:
+    elif util_int < UTIL_THRESHOLD_HIGH:
         return term.on_color_rgb(255, 165, 0) + term.black + padding(text) + term.normal
     elif util_int <= 100:
         return term.on_color_rgb(255, 0, 0) + white + padding(text) + term.normal
@@ -251,22 +238,24 @@ def legend(term, maxnode):
     gu = "   " + term.normal + " GPU utilization is "
     s = ""
     s += offset + term.on_black + gu + "0%\n"
-    s += offset + term.on_blue + gu + "0-25%\n"
-    s += offset + term.on_cyan + gu + "25-50%\n"
-    s += offset + term.on_color_rgb(255, 165, 0) + gu + "50-75%\n"
-    s += offset + term.on_color_rgb(255, 0, 0) + gu + "75-100%\n"
+    s += offset + term.on_blue + gu + f"0-{UTIL_THRESHOLD_LOW}%\n"
+    s += offset + term.on_cyan + gu + f"{UTIL_THRESHOLD_LOW}-{UTIL_THRESHOLD_MED}%\n"
+    s += offset + term.on_color_rgb(255, 165, 0) + gu + f"{UTIL_THRESHOLD_MED}-{UTIL_THRESHOLD_HIGH}%\n"
+    s += offset + term.on_color_rgb(255, 0, 0) + gu + f"{UTIL_THRESHOLD_HIGH}-100%\n"
     return s
 
 
 def parse_time(time_str):
-    """Parse time string like '1h', '30m' to seconds."""
-    match = re.match(r"(\d+)([hm])", time_str.lower())
+    """Parse time string like '1d', '1h', '30m' to seconds."""
+    match = re.match(r"(\d+)([dhm])", time_str.lower())
     if not match:
-        print(f"Invalid time format: {time_str}. Use format like '1h' or '30m'")
+        print(f"Invalid time format: {time_str}. Use format like '1d', '1h' or '30m'")
         sys.exit(1)
     value, unit = match.groups()
     value = int(value)
-    if unit == "h":
+    if unit == "d":
+        return value * 86400
+    elif unit == "h":
         return value * 3600
     elif unit == "m":
         return value * 60
@@ -298,6 +287,9 @@ if __name__ == "__main__":
 
       Show dashboard for all users without displaying legend:
         $ gpudash -n
+
+      Output data in JSON format for programmatic use:
+        $ gpudash --json | jq '.summary'
     """),
     )
     psr.add_argument("-u", type=str, action="store", dest="netid", default="-1", help="create dashboard for a single user")
@@ -306,6 +298,7 @@ if __name__ == "__main__":
     psr.add_argument("-c", "--chars-per-cell", type=int, default=15, help="number of characters per cell in the dashboard. Default: 15")
     psr.add_argument("-p", "--period", type=str, default="1h", help="time period to show (e.g., 1h, 2h, 30m). Default: 1h")
     psr.add_argument("-i", "--interval", type=str, default="10m", help="sampling interval (e.g., 5m, 10m, 15m). Default: 10m")
+    psr.add_argument("--json", action="store_true", help="output data in JSON format instead of dashboard")
     args = psr.parse_args()
 
     show_legend = not args.no_legend
@@ -321,15 +314,6 @@ if __name__ == "__main__":
     end_time = int(time.time())
     start_time = end_time - period_seconds
 
-    # Get node list and GPU counts dynamically from Slurm
-    gpus_per_node = get_nodes()
-    if not gpus_per_node:
-        print("No GPU nodes found from sinfo. Exiting ...")
-        sys.exit(0)
-
-    nodelist = sorted(list(gpus_per_node.keys()))
-    maxnode = max(map(len, nodelist)) if nodelist else 0
-
     # Generate uid to username mapping
     uid2user = generate_uid2user_mapping()
 
@@ -338,9 +322,17 @@ if __name__ == "__main__":
     duty_cycle_data = query_prometheus_range("nvidia_gpu_duty_cycle", start_time, end_time, step)
     uid_data = query_prometheus_range("nvidia_gpu_jobUid", start_time, end_time, step)
 
-    # Process the data
-    util_by_time = process_range_data(duty_cycle_data, nodelist)
-    uid_by_time = process_range_data(uid_data, nodelist, uid2user)
+    # Process the data and extract node information
+    util_by_time, gpus_per_node = process_range_data(duty_cycle_data)
+    uid_by_time, _ = process_range_data(uid_data, uid2user)
+
+    # Check if we found any nodes
+    if not gpus_per_node:
+        print("No GPU nodes found from Prometheus. Exiting ...")
+        sys.exit(0)
+
+    nodelist = sorted(list(gpus_per_node.keys()))
+    maxnode = max(map(len, nodelist)) if nodelist else 0
 
     # Get all timestamps and sort them
     all_timestamps = sorted(set(util_by_time.keys() | uid_by_time.keys()))
@@ -372,14 +364,40 @@ if __name__ == "__main__":
 
                 stats[(twelve_hour, node, gpu_index_str)] = (username, util)
 
-    # Construct and print dashboard
-    term = Terminal()
-    dashboard, founduser_all_nodes = construct_dashboard(nodelist, gpus_per_node, stats, times, maxnode, term, args)
-    print(dashboard)
+    if args.json:
+      # Output in JSON format if requested
+        json_output = {
+            "timestamp": datetime.now().isoformat(),
+            "period": args.period,
+            "interval": args.interval,
+            "nodes": {},
+            "summary": {
+                "total_gpus": sum(gpus_per_node.values()),
+                "total_nodes": len(nodelist),
+                "active_users": len(set(u for (u, _) in stats.values() if u not in ["root", "OFFLINE", "NODE LOST"])),
+            },
+        }
 
-    if args.netid == "-1":
-        if show_legend:
-            print(legend(term, maxnode))
+        for node in nodelist:
+            json_output["nodes"][node] = {"gpu_count": gpus_per_node[node], "gpus": {}}
+            for gpu_idx in range(gpus_per_node[node]):
+                gpu_idx_str = str(gpu_idx)
+                json_output["nodes"][node]["gpus"][gpu_idx_str] = []
+                for time_label in times:
+                    if (time_label, node, gpu_idx_str) in stats:
+                        username, util = stats[(time_label, node, gpu_idx_str)]
+                        json_output["nodes"][node]["gpus"][gpu_idx_str].append({"time": time_label, "user": username, "utilization": util})
+
+        print(json.dumps(json_output, indent=2))
     else:
-        if show_legend and founduser_all_nodes:
-            print(legend(term, maxnode))
+        # Construct and print dashboard
+        term = Terminal()
+        dashboard, founduser_all_nodes = construct_dashboard(nodelist, gpus_per_node, stats, times, maxnode, term, args)
+        print(dashboard)
+
+        if args.netid == "-1":
+            if show_legend:
+                print(legend(term, maxnode))
+        else:
+            if show_legend and founduser_all_nodes:
+                print(legend(term, maxnode))
