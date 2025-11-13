@@ -6,156 +6,289 @@ import argparse
 import textwrap
 import json
 import subprocess
+import re
+import time
+import urllib.request
+import urllib.error
 from functools import partial
-from glob import glob
-from datetime import datetime, timedelta
-from socket import gethostname
+from datetime import datetime
 from blessed import Terminal
 
-def second_tues_of_month(year, month):
-  """Return a date object for the second Tuesday of the current month."""
-  import calendar
-  c = calendar.Calendar(firstweekday=calendar.SUNDAY)
-  monthcal = c.monthdatescalendar(year, month)
-  all_tues_of_month = [day for week in monthcal for day in week if \
-                       day.weekday() == calendar.TUESDAY and \
-                       day.month == month]
-  second_tues = all_tues_of_month[1]
-  hours_24_clock, minutes = (6, 0)  # six AM
-  return datetime(second_tues.year, second_tues.month, second_tues.day, hours_24_clock, minutes)
+# Configuration
+PROM_URL = os.getenv("GPUDASH_PROM_URL", "http://localhost:9200/prom/neumann")
 
-# add white space with text in the center
+
+def get_nodes():
+    """Parse sinfo output to get node names, GPU counts, and filter out offline nodes."""
+    try:
+        output = subprocess.run('sinfo -N -h -o "%N,%G,%t"', capture_output=True, shell=True, timeout=10, check=True)
+        lines = output.stdout.decode("utf-8").strip().split("\n")
+
+        nodes_gpus = {}
+        seen_nodes = set()
+
+        for line in lines:
+            if not line.strip():
+                continue
+            parts = line.split(",")
+            if len(parts) < 3:
+                continue
+
+            node_name = parts[0].strip()
+
+            # make sure we only process each node once
+            if node_name in seen_nodes:
+                continue
+            seen_nodes.add(node_name)
+
+            state = parts[-1].strip()
+            gres_info = ",".join(parts[1:-1])
+
+            # Skip nodes that are offline, draining, or down
+            if any([term in state.lower() for term in ["drain", "down", "boot"]]):
+                continue
+
+            # Parse GPU count from GRES string like "gpu:a100:8(S:0-1)"
+            # Format can be: gpu:type:count(S:...) or multiple comma-separated entries
+            total_gpus = 0
+            for gres_part in gres_info.split(","):
+                gres_part = gres_part.strip()
+                if gres_part.startswith("gpu:"):
+                    # Extract count from gpu:type:count(...)
+                    match = re.search(r"gpu:[^:]+:(\d+)", gres_part)
+                    if match:
+                        total_gpus += int(match.group(1))
+
+            if total_gpus > 0:
+                nodes_gpus[node_name] = total_gpus
+
+        return nodes_gpus
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"Error running sinfo command: {e}")
+        return {}
+
+
+def query_prometheus_range(metric_name, start_time, end_time, step="5m"):
+    """Query Prometheus for a metric over a time range."""
+    url = f"{PROM_URL}/api/v1/query_range?query={metric_name}&start={start_time}&end={end_time}&step={step}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = response.read()
+            return json.loads(data)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        print(f"Error querying Prometheus for {metric_name}: {e}")
+        return {"status": "error", "data": {"result": []}}
+
+
+def generate_uid2user_mapping():
+    """Generate uid to username mapping dictionary using getent passwd."""
+    try:
+        output = subprocess.run("getent passwd", shell=True, capture_output=True, timeout=10, check=True)
+        lines = output.stdout.decode("utf-8").strip().split("\n")
+        uid2user = {}
+        for line in lines:
+            parts = line.split(":")
+            if len(parts) >= 3:
+                uid = parts[2]
+                username = parts[0]
+                uid2user[uid] = username
+        return uid2user
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"Warning: Error generating uid2user mapping: {e}", file=sys.stderr)
+        return {}
+
+
+def process_range_data(metric_data, nodelist, uid2user=None):
+    """
+    Process Prometheus range query data and organize by timestamp.
+    Returns: dict with structure {timestamp: {(node, gpu_index): value}}
+    """
+    result = {}
+
+    if metric_data.get("status") != "success":
+        return result
+
+    for series in metric_data.get("data", {}).get("result", []):
+        hostname = series["metric"]["instance"].split(":")[0]
+        if hostname not in nodelist:
+            continue
+
+        gpu_index = series["metric"]["minor_number"]
+        values = series.get("values", [])
+
+        for timestamp, value in values:
+            ts = int(timestamp)
+            if ts not in result:
+                result[ts] = {}
+
+            # Convert UID to username if this is UID data and mapping is available
+            if uid2user and value in uid2user:
+                value = uid2user[value]
+
+            result[ts][(hostname, gpu_index)] = value
+
+    return result
+
+
 def center(maxlen, txt):
-  n = len(txt)
-  if n > maxlen: txt = txt[:maxlen]
-  pre  = " " * int(0.5 * (maxlen - n))
-  post = " " * (maxlen - n - len(pre))
-  return pre + txt + post
+    """Add white space with text in the center."""
+    n = len(txt)
+    if n > maxlen:
+        txt = txt[:maxlen]
+    pre = " " * int(0.5 * (maxlen - n))
+    post = " " * (maxlen - n - len(pre))
+    return pre + txt + post
 
-def leftpad(txt):
-  n = len(txt)
-  return " " * (maxnode - n) + txt
 
-# get list of nodes while ignoring those offline
-def get_nodes(all_nodes, cmd):
-  try:
-    output = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, check=True, timeout=3)
-    lines = output.stdout.decode("utf-8").split('\n')
-  except:
-    return (all_nodes, [])
-  else:
-    nodes = []
-    reserved = []
-    for line in lines:
-      if line and not any([term in line for term in ["drain", "down", "boot"]]) and line.split()[0] in all_nodes:
-        nodes.append(line.split()[0])
-      if line and (("resv" in line) or ("mig" in line)):
-        reserved.append(line.split()[0])
-    return (nodes, reserved)
+def leftpad(txt, maxnode):
+    """Left pad text to maxnode length."""
+    n = len(txt)
+    return " " * (maxnode - n) + txt
 
-def colorize(user, util):
-  if user == "OFFLINE": return padding(user)
-  text = f"{user}:{util}"
-  if text == "root:0":
-    return term.on_gray + term.black + padding("IDLE") + term.normal
-  if text == "root:N/A":
-    return term.on_gray + term.black + padding("NO INFO") + term.normal
-  white = term.color_rgb(255,255,255)
-  if isinstance(util, int):
-    util = str(util)
-  util = int(util) if util.isdigit() else -1
-  if util == -1:
-    return term.on_gray + term.black + padding(text) + term.normal
-  elif util == 0:
-    return term.on_black + white + padding(text) + term.normal
-  elif util < 25:
-    return term.on_blue + white + padding(text) + term.normal
-  elif util < 50:
-    return term.on_cyan + term.black + padding(text) + term.normal
-  elif util < 75:
-    return term.on_color_rgb(255,165,0) + term.black + padding(text) + term.normal
-  elif util <= 100:
-    return term.on_color_rgb(255,0,0) + white + padding(text) + term.normal
-  else:
-    return padding(text)
 
-def construct_dashboard(host):
-  s = "\n"
-  day_date = str(datetime.now().strftime("%a %b %-d"))
-  text = f"{title} UTILIZATION ({day_date})"
-  total_width = chars_per_cell * len(times) + maxnode + 3
-  s += center(total_width, text)
-  s += "\n\n"
-  # time labels at top of dashboard
-  s += " " * (maxnode + 3)
-  for t in times:
-    s += padding(t)
-  s += "\n"
-  # main dashboard
-  global founduser_all_nodes
-  founduser_all_nodes = False
-  for node in nodelist:
-    rows = ""
-    founduser_per_node = False
-    offline = 0
-    for gpu_index in [str(i) for i in range(gpus_per_node[node])]:
-      if gpu_index == "0":
-        rows += leftpad(node)
-      elif gpu_index == "1" and node in reserved_nodes:
-        # modify next line to label reserved nodes
-        rows += " " * maxnode
-      else:
-        rows += " " * maxnode
-      rows += " " + gpu_index + " "
-      for j, t in enumerate(times):
-        if (t, node, gpu_index) in stats:
-          username, util = stats[(t, node, gpu_index)]
-        else:
-          username, util = ("NODE LOST", 0)
-        if args.netid == username:
-          founduser_per_node = True
-          founduser_all_nodes = True
-        if j == len(times) - 1 and username == "OFFLINE": offline += 1
-        rows += colorize(username, util)
-      rows += "\n"
-    if (args.netid == "-1" or founduser_per_node) and offline < gpus_per_node[node]:
-      s += rows
-  # time labels at bottom of dashboard
-  if args.netid == "-1":
+def colorize(user, util, term, padding):
+    """Colorize the dashboard cell based on user and utilization."""
+    if user == "OFFLINE":
+        return padding(user)
+
+    if user == "NODE LOST":
+        return term.on_gray + term.black + padding(user) + term.normal
+
+    text = f"{user}:{util}"
+    if text == "root:0":
+        return term.on_gray + term.black + padding("IDLE") + term.normal
+    if text == "root:N/A":
+        return term.on_gray + term.black + padding("NO INFO") + term.normal
+
+    white = term.color_rgb(255, 255, 255)
+
+    # Parse utilization value
+    try:
+        util_int = int(round(float(util)))
+    except (ValueError, TypeError):
+        util_int = -1
+
+    if util_int == -1 or util == "N/A":
+        return term.on_gray + term.black + padding(text) + term.normal
+    elif util_int == 0:
+        return term.on_black + white + padding(text) + term.normal
+    elif util_int < 25:
+        return term.on_blue + white + padding(text) + term.normal
+    elif util_int < 50:
+        return term.on_cyan + term.black + padding(text) + term.normal
+    elif util_int < 75:
+        return term.on_color_rgb(255, 165, 0) + term.black + padding(text) + term.normal
+    elif util_int <= 100:
+        return term.on_color_rgb(255, 0, 0) + white + padding(text) + term.normal
+    else:
+        return padding(text)
+
+
+def construct_dashboard(nodelist, gpus_per_node, stats, times, maxnode, term, args):
+    """Construct the GPU utilization dashboard."""
+    s = "\n"
+    day_date = str(datetime.now().strftime("%a %b %-d"))
+    text = f"GPU UTILIZATION ({day_date})"
+    total_width = args.chars_per_cell * len(times) + maxnode + 3
+    s += center(total_width, text)
+    s += "\n\n"
+
+    # Time labels at top of dashboard
     s += " " * (maxnode + 3)
+    padding = partial(center, args.chars_per_cell)
     for t in times:
-      s += padding(t)
+        s += padding(t)
     s += "\n"
-  # no jobs found for single user
-  if args.netid != "-1" and not founduser_all_nodes:
-    s += center(total_width, f"No GPU jobs found for {args.netid}\n")
-  return s
 
-def legend():
-  offset = " " * (maxnode + 3)
-  gu = "   " + term.normal  + " GPU utilization is "
-  s = ""
-  s += offset + term.on_black + gu + "0%\n"
-  s += offset + term.on_blue  + gu + "0-25%\n"
-  s += offset + term.on_cyan  + gu + "25-50%\n"
-  s += offset + term.on_color_rgb(255,165,0)  + gu + "50-75%\n"
-  s += offset + term.on_color_rgb(255,0,0)    + gu + "75-100%\n"
-  return s
+    # Main dashboard
+    founduser_all_nodes = False
+    for node in nodelist:
+        rows = ""
+        founduser_per_node = False
+        offline = 0
+        for gpu_index in [str(i) for i in range(gpus_per_node[node])]:
+            if gpu_index == "0":
+                rows += leftpad(node, maxnode)
+            else:
+                rows += " " * maxnode
+            rows += " " + gpu_index + " "
+
+            for j, t in enumerate(times):
+                if (t, node, gpu_index) in stats:
+                    username, util = stats[(t, node, gpu_index)]
+                else:
+                    username, util = ("NODE LOST", 0)
+
+                if args.netid == username:
+                    founduser_per_node = True
+                    founduser_all_nodes = True
+                if j == len(times) - 1 and username == "OFFLINE":
+                    offline += 1
+                rows += colorize(username, util, term, padding)
+            rows += "\n"
+
+        if (args.netid == "-1" or founduser_per_node) and offline < gpus_per_node[node]:
+            s += rows
+
+    # Time labels at bottom of dashboard
+    if args.netid == "-1":
+        s += " " * (maxnode + 3)
+        for t in times:
+            s += padding(t)
+        s += "\n"
+
+    # No jobs found for single user
+    if args.netid != "-1" and not founduser_all_nodes:
+        s += center(total_width, f"No GPU jobs found for {args.netid}\n")
+
+    return s, founduser_all_nodes
+
+
+def legend(term, maxnode):
+    """Generate the legend for the dashboard."""
+    offset = " " * (maxnode + 3)
+    gu = "   " + term.normal + " GPU utilization is "
+    s = ""
+    s += offset + term.on_black + gu + "0%\n"
+    s += offset + term.on_blue + gu + "0-25%\n"
+    s += offset + term.on_cyan + gu + "25-50%\n"
+    s += offset + term.on_color_rgb(255, 165, 0) + gu + "50-75%\n"
+    s += offset + term.on_color_rgb(255, 0, 0) + gu + "75-100%\n"
+    return s
+
+
+def parse_time(time_str):
+    """Parse time string like '1h', '30m' to seconds."""
+    match = re.match(r"(\d+)([hm])", time_str.lower())
+    if not match:
+        print(f"Invalid time format: {time_str}. Use format like '1h' or '30m'")
+        sys.exit(1)
+    value, unit = match.groups()
+    value = int(value)
+    if unit == "h":
+        return value * 3600
+    elif unit == "m":
+        return value * 60
+    return value
+
 
 if __name__ == "__main__":
-
-  psr = argparse.ArgumentParser(
-    description="GPU utilization dashboard for the last hour",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog=textwrap.dedent('''
+    psr = argparse.ArgumentParser(
+        description="GPU utilization dashboard",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
     Utilization is the percentage of time during a sampling window (< 1 second) that
     a kernel was running on the GPU. The format of each entry in the dashboard is
     username:utilization (e.g., aturing:90). Utilization varies between 0 and 100%.
 
     Examples:
 
-      Show dashboard for all users:
+      Show dashboard for all users (last hour):
         $ gpudash
+
+      Show dashboard for last 2 hours with 10-minute intervals:
+        $ gpudash --period 2h --interval 10m
 
       Show dashboard for the current user:
         $ gpudash --me
@@ -165,76 +298,88 @@ if __name__ == "__main__":
 
       Show dashboard for all users without displaying legend:
         $ gpudash -n
-    '''))
-  psr.add_argument('-u', type=str, action='store', dest='netid',
-                   default='-1', help='create dashboard for a single user')
-  psr.add_argument('-n', '--no-legend', action='store_true', help='flag to hide the legend')
-  psr.add_argument('--me', action='store_true', help='create dashboard for current user')
-  args = psr.parse_args()
-  show_legend = not args.no_legend
-  if args.me:
-    args.netid = os.getenv("USER")
-    if not args.netid:
-      args.netid = "-1"
+    """),
+    )
+    psr.add_argument("-u", type=str, action="store", dest="netid", default="-1", help="create dashboard for a single user")
+    psr.add_argument("-n", "--no-legend", action="store_true", help="flag to hide the legend")
+    psr.add_argument("--me", action="store_true", help="create dashboard for current user")
+    psr.add_argument("-c", "--chars-per-cell", type=int, default=15, help="number of characters per cell in the dashboard. Default: 15")
+    psr.add_argument("-p", "--period", type=str, default="1h", help="time period to show (e.g., 1h, 2h, 30m). Default: 1h")
+    psr.add_argument("-i", "--interval", type=str, default="10m", help="sampling interval (e.g., 5m, 10m, 15m). Default: 10m")
+    args = psr.parse_args()
 
-  # load cluster-specific info
-  host = gethostname()
-  if host.startswith("cluster1"):
-    title = "CLUSTER1-GPU"
-    comp_nodes_base = "cluster1-"
-    all_nodes = [comp_nodes_base + "i14g" + str(g) for g in range(1, 21)]
-    gpus_per_node = dict([(node, 2) for node in all_nodes])
-    #nodelist, reserved_nodes = get_nodes(all_nodes, "timeout 3 sinfo --partition=gpu --Node -h")
-    nodelist, reserved_nodes = all_nodes, []
-    maxnode = max(map(len, nodelist))
-    SBASE = "/scratch/.gpudash"
-  elif host.startswith("cluster2"):
-    title = "Cluster2-GPU"
-    comp_nodes_base = "cluster2-"
-    all_nodes = [comp_nodes_base + "i" + str(i) + 'g' + str(j + 1) for i in range(19, 24) for j in range(16)]
-    gpus_per_node = dict([(node, 4) for node in all_nodes])
-    #nodelist, reserved_nodes = get_nodes(all_nodes, "timeout 3 sinfo --partition=gpu --Node -h")
-    nodelist, reserved_nodes = all_nodes, []
-    maxnode = max(map(len, nodelist))
-    SBASE = "/scratch/.gpudash"
-  else:
-    print(f"{host} is unknown.")
-    sys.exit(0)
+    show_legend = not args.no_legend
+    if args.me:
+        args.netid = os.getenv("USER")
+        if not args.netid:
+            args.netid = "-1"
 
-  # read column files
-  column_files = sorted(glob(f"{SBASE}/column.*"))
-  if column_files == []:
-    print(f"No column files were found in {SBASE}. Exiting ...")
-    sys.exit(0)
+    period_seconds = parse_time(args.period)
+    interval_seconds = parse_time(args.interval)
 
-  #{"timestamp": "1622344202", "host": "della-i14g15", "index": "0", "user": "OFFLINE", "util": "N/A", "jobid": "N/A"}
-  #{"timestamp": "1622344202", "host": "della-i14g15", "index": "1", "user": "OFFLINE", "util": "N/A", "jobid": "N/A"}
-  #{"timestamp": "1622344202", "host": "della-i14g19", "index": "0", "user": "root", "util": "0", "jobid": "0"}
-  #{"timestamp": "1622344202", "host": "della-i14g19", "index": "1", "user": "root", "util": "0", "jobid": "0"}
-  #{"timestamp": "1622344202", "host": "della-i14g20", "index": "0", "user": "gdolsten", "util": "40", "jobid": "34792230"}
-  #{"timestamp": "1622344202", "host": "della-i14g20", "index": "1", "user": "root", "util": "0", "jobid": "0"}
+    # Calculate time range
+    end_time = int(time.time())
+    start_time = end_time - period_seconds
 
-  # create dictionary from column files
-  stats = {}
-  times = []
-  for column_file in column_files:
-    with open(column_file) as f:
-      for i, line in enumerate(f.readlines()):
-        d = json.loads(line)
-        if i == 0:
-          timestamp = d["timestamp"]
-          twelve_hour = datetime.fromtimestamp(int(timestamp)).strftime('%-I:%M %p')
-          times.append(twelve_hour)
-        stats[(twelve_hour, d["host"], d["index"])] = (d["user"], d["util"])
+    # Get node list and GPU counts dynamically from Slurm
+    gpus_per_node = get_nodes()
+    if not gpus_per_node:
+        print("No GPU nodes found from sinfo. Exiting ...")
+        sys.exit(0)
 
-  # construct and print dashboard
-  term = Terminal()
-  chars_per_cell = 14
-  padding = partial(center, chars_per_cell)
-  print(construct_dashboard(host))
-  if args.netid == "-1":
-    if show_legend:
-      print(legend())
-  else:
-    if show_legend and founduser_all_nodes:
-      print(legend())
+    nodelist = sorted(list(gpus_per_node.keys()))
+    maxnode = max(map(len, nodelist)) if nodelist else 0
+
+    # Generate uid to username mapping
+    uid2user = generate_uid2user_mapping()
+
+    # Query Prometheus for GPU metrics over the time range
+    step = f"{interval_seconds}s"
+    duty_cycle_data = query_prometheus_range("nvidia_gpu_duty_cycle", start_time, end_time, step)
+    uid_data = query_prometheus_range("nvidia_gpu_jobUid", start_time, end_time, step)
+
+    # Process the data
+    util_by_time = process_range_data(duty_cycle_data, nodelist)
+    uid_by_time = process_range_data(uid_data, nodelist, uid2user)
+
+    # Get all timestamps and sort them
+    all_timestamps = sorted(set(util_by_time.keys() | uid_by_time.keys()))
+
+    if not all_timestamps:
+        print("No data available for the specified time range.")
+        sys.exit(0)
+
+    # Build stats dictionary
+    stats = {}
+    times = []
+
+    for ts in all_timestamps:
+        twelve_hour = datetime.fromtimestamp(ts).strftime("%-I:%M %p")
+        times.append(twelve_hour)
+
+        # Initialize all GPUs for this timestamp
+        for node in nodelist:
+            for gpu_index in range(gpus_per_node[node]):
+                gpu_index_str = str(gpu_index)
+
+                # Get values from each metric
+                util = util_by_time.get(ts, {}).get((node, gpu_index_str), "N/A")
+                username = uid_by_time.get(ts, {}).get((node, gpu_index_str), "OFFLINE")
+
+                # Handle the case where we have util=0 but no user info
+                if username == "OFFLINE" and util == "0":
+                    username = "root"
+
+                stats[(twelve_hour, node, gpu_index_str)] = (username, util)
+
+    # Construct and print dashboard
+    term = Terminal()
+    dashboard, founduser_all_nodes = construct_dashboard(nodelist, gpus_per_node, stats, times, maxnode, term, args)
+    print(dashboard)
+
+    if args.netid == "-1":
+        if show_legend:
+            print(legend(term, maxnode))
+    else:
+        if show_legend and founduser_all_nodes:
+            print(legend(term, maxnode))
